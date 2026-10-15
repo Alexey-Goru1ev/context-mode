@@ -1,3 +1,13 @@
+> [!IMPORTANT]
+> **This is a fork branch, not the upstream project.**
+> Source: [mksglu/context-mode](https://github.com/mksglu/context-mode) · Branch: [`fix/opencode-v2-plugin-api`](https://github.com/Alexey-Goru1ev/context-mode/tree/fix/opencode-v2-plugin-api) · Upstream is the canonical home — prefer it once this fix lands there.
+>
+> **Why this branch exists:** upstream `context-mode@1.0.169` does not load on **OpenCode v2** — the v2 plugin loader rejects v1 plugin implementations with
+> `PluginModule.LoadError: Plugin must export a default definition with an id and an effect or setup function`.
+> This branch ports the OpenCode adapter to the [v2 plugin API](https://opencode.ai/v2/docs/build/plugins/migrate-v1) as a dual-support `{ id, setup, server }` entrypoint (v2 reads `setup()`, v1/KiloCode call `server()`), with the v1 path's behavior unchanged. See the branch commit for the full change and test/verification evidence.
+>
+> The fix lives on a fork only because the upstream repository has **pull-request creation restricted and issues disabled**, so there is no channel to submit it upstream. Maintainer (or anyone with push access): the branch is a single commit on top of `next` and can be cherry-picked/merged directly.
+
 # Context Mode
 
 **The other half of the context problem.**
