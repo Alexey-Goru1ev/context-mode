@@ -1,7 +1,11 @@
 /**
  * OpenCode / KiloCode TypeScript plugin entry point for context-mode.
  *
- * Provides five hooks (v1.0.107 — Mickey OC-1..OC-4 follow-up):
+ * Dual-support entrypoint (OpenCode v2 "Support V1" pattern):
+ *   - OpenCode v2 reads default.id + default.setup() → src/adapters/opencode/v2.ts
+ *   - OpenCode v1 / KiloCode call default.server() → V1 hooks below
+ *
+ * V1 path provides five hooks (v1.0.107 — Mickey OC-1..OC-4 follow-up):
  *   - tool.execute.before  — Routing enforcement (deny/modify/passthrough)
  *   - tool.execute.after   — Session event capture + first-fire AGENTS.md scan (OC-4)
  *   - experimental.session.compacting — Compaction snapshot + budget-capped auto-injection (OC-3)
@@ -11,8 +15,8 @@
  * KiloCode loads this via: import("context-mode") → expects default export
  * with shape { server: (input) => Promise<Hooks> } (PluginModule).
  *
- * OpenCode loads this via: import("context-mode/plugin") → also supports
- * the named export ContextModePlugin for backward compat.
+ * OpenCode v2 loads this via: import("context-mode/plugin") → reads
+ * default.setup(ctx) and registers tools/hooks through the v2 context.
  *
  * Constraints:
  *   - No SessionStart hook (OpenCode doesn't support it — #14808, #5409)
@@ -33,6 +37,7 @@ import type { SessionEvent } from "../../types.js";
 import { AdapterPlatformType, OpenCodeAdapter } from "./index.js";
 import { PLATFORM_ENV_VARS } from "../detect.js";
 import { zod3ShapeToV4 } from "./zod3tov4.js";
+import { createV2Setup } from "./v2.js";
 
 // ── Types ─────────────────────────────────────────────────
 
@@ -76,7 +81,7 @@ type NativeToolContext = {
   metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void;
 };
 
-type NativeToolDefinition = {
+export type NativeToolDefinition = {
   description: string;
   args: Record<string, unknown>;
   execute: (
@@ -195,7 +200,7 @@ const SYNTHETIC_MESSAGE_PREFIXES = [
   "<tool-result>",
 ];
 
-function isSyntheticMessage(text: string): boolean {
+export function isSyntheticMessage(text: string): boolean {
   const trimmed = text.trim();
   return SYNTHETIC_MESSAGE_PREFIXES.some((p) => trimmed.startsWith(p));
 }
@@ -252,16 +257,22 @@ function getPlatform(): AdapterPlatformType {
   return "opencode";
 }
 
-// ── Plugin Factory ────────────────────────────────────────
+// ── Plugin Core (shared by V1 and V2 hosts) ───────────────
 
 /**
- * Plugin factory. Called once when KiloCode/OpenCode loads the plugin.
- * Returns an object mapping hook event names to async handler functions.
+ * Host-agnostic plugin core: everything that is identical across the
+ * OpenCode v1 and v2 plugin APIs — routing init, routing-block build,
+ * SessionDB, AGENTS.md capture, and native ctx_* tool construction.
  *
- * KiloCode expects: export default { id: string, server: (input) => Promise<Hooks> }
- * OpenCode expects: export const ContextModePlugin = (ctx) => Promise<Hooks>
+ * `port` abstracts the only two host differences that exist during init:
+ * the project directory and a best-effort log sink.
  */
-async function createContextModePlugin(ctx: PluginContext) {
+export type PluginHostPort = {
+  directory: string;
+  log: (message?: string, extra?: PluginClientAppLogBodyExtra) => Promise<void>;
+};
+
+export async function createPluginCore(port: PluginHostPort) {
   // Resolve build dir from compiled JS location
   const platform = getPlatform();
   const adapter = new OpenCodeAdapter(platform);
@@ -295,7 +306,7 @@ async function createContextModePlugin(ctx: PluginContext) {
   // OpenCode/Kilo provide the real `input.sessionID` on every hook, and a
   // process-global UUID would (a) never match prior-session resume rows and
   // (b) collide across multi-session reuse (Mickey / PR #376 root cause).
-  const projectDir = ctx?.directory ?? process.cwd();
+  const projectDir = port.directory ?? process.cwd();
   // C2 narrowing: resolve DB path through the canonical helper directly.
   // BaseAdapter no longer exposes getSessionDBPath; the adapter only owns
   // the sessions DIR (per-platform), the helper owns the per-project FILE
@@ -355,14 +366,7 @@ async function createContextModePlugin(ctx: PluginContext) {
     message = "context-mode debug log",
     extra?: PluginClientAppLogBodyExtra,
   ): Promise<void> {
-    return ctx.client.app.log({
-      body: {
-        service: "context-mode-logger",
-        level: "info",
-        message,
-        extra,
-      },
-    });
+    return port.log(message, extra);
   }
 
   /**
@@ -478,6 +482,54 @@ async function createContextModePlugin(ctx: PluginContext) {
   }
 
   const nativeTools = await buildNativeTools();
+
+  return {
+    platform,
+    adapter,
+    routing,
+    routingBlock,
+    autoInjectionMod,
+    db,
+    projectDir,
+    captureAgentsMd,
+    safeLog,
+    nativeTools,
+  };
+}
+
+// ── V1 Plugin Factory (OpenCode v1 / KiloCode) ────────────
+
+/**
+ * V1 plugin factory. Called once when an OpenCode v1 / KiloCode host loads
+ * the plugin — via the default export's `server()` (KiloCode PluginModule
+ * shape) or via the named `ContextModePlugin` export.
+ *
+ * Returns an object mapping V1 hook event names to async handler functions.
+ */
+async function createContextModePlugin(ctx: PluginContext) {
+  const core = await createPluginCore({
+    directory: ctx?.directory ?? process.cwd(),
+    log: (message = "context-mode debug log", extra) =>
+      ctx.client.app.log({
+        body: {
+          service: "context-mode-logger",
+          level: "info",
+          message,
+          extra,
+        },
+      }),
+  });
+  const {
+    platform,
+    routing,
+    routingBlock,
+    autoInjectionMod,
+    db,
+    projectDir,
+    captureAgentsMd,
+    safeLog,
+    nativeTools,
+  } = core;
 
   return {
     tool: nativeTools,
@@ -752,9 +804,14 @@ async function createContextModePlugin(ctx: PluginContext) {
 }
 
 // ── Exports ──────────────────────────────────────────────
-// KiloCode PluginModule: default export with { server } shape
-// OpenCode compat: named export for direct import("context-mode/plugin")
-export default { id:"context-mode", server: createContextModePlugin };
+// Dual-support entrypoint (OpenCode v2 "Support V1" pattern):
+//   - OpenCode v2 reads default.id + default.setup() and ignores `server`.
+//   - OpenCode v1 / KiloCode call default.server() and ignore `setup`.
+// The ESM cycle with ./v2.js is safe: both modules only reference each
+// other's exports lazily (inside function bodies), never at module-eval time.
+const setupOpenCodeV2 = createV2Setup();
+
+export default { id: "context-mode", setup: setupOpenCodeV2, server: createContextModePlugin };
 export { createContextModePlugin as ContextModePlugin };
 // Test surface — exported for unit testing the quorum substring fix (#487).
 export { systemHasRoutingInstructions, ROUTING_MARKERS };

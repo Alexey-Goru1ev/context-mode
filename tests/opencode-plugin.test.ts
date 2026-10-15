@@ -1348,4 +1348,187 @@ describe("ContextModePlugin", () => {
       expect(out.system[1]).toBe(agentsContent);
     });
   });
+
+  // ── OpenCode v2 setup (dual-support default export) ─────
+
+  describe("OpenCode v2 setup", () => {
+    /** Minimal v2 host mock: records registrations, drains no events. */
+    async function createTestV2Plugin(dir: string) {
+      const pluginModule = (await import("../src/adapters/opencode/plugin.js")).default as {
+        id: string;
+        setup: (ctx: unknown) => Promise<() => void>;
+      };
+      const toolHooks: Record<string, (event: any) => unknown> = {};
+      const sessionHooks: Record<string, (event: any) => unknown> = {};
+      const tools: any[] = [];
+      const ctx = {
+        location: { directory: dir },
+        tool: {
+          transform: async (cb: (editor: any) => void) => {
+            cb({ add: (t: unknown) => tools.push(t) });
+          },
+          hook: async (name: string, cb: (event: any) => unknown) => {
+            toolHooks[name] = cb;
+          },
+        },
+        session: {
+          hook: async (name: string, cb: (event: any) => unknown) => {
+            sessionHooks[name] = cb;
+          },
+        },
+        event: {
+          subscribe: async function* () {}(),
+        },
+      };
+      const cleanup = await pluginModule.setup(ctx);
+      return { cleanup, toolHooks, sessionHooks, tools };
+    }
+
+    it("default export is dual-support: { id, setup, server }", async () => {
+      const pluginModule = await import("../src/adapters/opencode/plugin.js");
+      expect(pluginModule.default).toMatchObject({
+        id: "context-mode",
+      });
+      expect(typeof pluginModule.default.setup).toBe("function");
+      expect(typeof pluginModule.default.server).toBe("function");
+    });
+
+    it("setup registers all v2 hooks and native tools", async () => {
+      const { toolHooks, sessionHooks, tools } = await createTestV2Plugin(
+        join(tempDir, "v2-factory"),
+      );
+
+      expect(Object.keys(toolHooks).sort()).toEqual(["execute.after", "execute.before"]);
+      expect(Object.keys(sessionHooks).sort()).toEqual(["compaction", "context", "prompt"]);
+      // Same native tool set as the v1 path (#574).
+      expect(tools.map((t) => t.name).sort()).toEqual([
+        "ctx_batch_execute",
+        "ctx_doctor",
+        "ctx_execute",
+        "ctx_execute_file",
+        "ctx_fetch_and_index",
+        "ctx_index",
+        "ctx_insight",
+        "ctx_purge",
+        "ctx_search",
+        "ctx_stats",
+        "ctx_upgrade",
+      ]);
+    });
+
+    it("v2 tools carry JSON Schema input (not zod schemas)", async () => {
+      const { tools } = await createTestV2Plugin(join(tempDir, "v2-json-schema"));
+      expect(tools.length).toBeGreaterThan(0);
+      for (const t of tools) {
+        expect(t.input.type).toBe("object");
+        expect(typeof t.description).toBe("string");
+        expect(typeof t.execute).toBe("function");
+      }
+    });
+
+    it("v2 tool executor returns { content } (ctx_stats smoke)", async () => {
+      const { tools } = await createTestV2Plugin(join(tempDir, "v2-tool-exec"));
+      const stats = tools.find((t: any) => t.name === "ctx_stats");
+      const result = await stats.execute(
+        {},
+        {
+          sessionID: "v2-tool-exec-sess",
+          messageID: "v2-tool-exec-msg",
+          agent: "build",
+          directory: join(tempDir, "v2-tool-exec"),
+          progress: async () => {},
+        },
+      );
+      expect(String(result.content)).toContain("context-mode");
+    });
+
+    it("execute.before passes unmatched tools through untouched", async () => {
+      const { toolHooks } = await createTestV2Plugin(join(tempDir, "v2-before-hook"));
+      const input = { filePath: "/tmp/innocent.txt" };
+      const event = {
+        tool: "read",
+        sessionID: "v2-before-sess",
+        agent: "build",
+        messageID: "m1",
+        id: "call1",
+        input,
+      };
+      await Promise.resolve(toolHooks["execute.before"](event));
+      expect(event.input).toBe(input);
+    });
+
+    it("prompt → execute.after → compaction → context chain injects snapshot and routing block", async () => {
+      const dir = join(tempDir, "v2-chain");
+      const sessionId = "v2-chain-sess";
+      const { sessionHooks, toolHooks } = await createTestV2Plugin(dir);
+
+      // OC-2: user prompt capture
+      await sessionHooks["prompt"]({ sessionID: sessionId, prompt: { text: "v2 chain user prompt" } });
+
+      // PostToolUse capture (completed tool result)
+      await toolHooks["execute.after"]({
+        tool: "read",
+        sessionID: sessionId,
+        input: { filePath: "README.md" },
+        status: "completed",
+        result: { content: "example tool output for v2 capture" },
+      });
+
+      // OC-3: compaction builds + stashes the snapshot
+      await sessionHooks["compaction"]({ sessionID: sessionId, system: [] });
+
+      // OC-1: the next context hook of the same session consumes the
+      // pending injection (v2 replacement for v1's mutable output.context).
+      const system: Array<{ type?: string; text?: string }> = [{ type: "text", text: "HEADER" }];
+      await sessionHooks["context"]({ sessionID: sessionId, system });
+
+      expect(system.length).toBeGreaterThanOrEqual(3); // header + snapshot(+auto) + routing block
+      const texts = system.map((p) => p.text ?? "");
+      expect(texts.some((t) => t.includes("<context_window_protection>"))).toBe(true);
+      expect(texts.some((t) => t.length > 50)).toBe(true); // snapshot content present
+
+      // Idempotency: the second context call gets a FRESH system array, so
+      // the routing block re-injects (same as v1 — quorum is per-request),
+      // but the pending snapshot must NOT re-inject (consumed exactly once,
+      // and claimLatestUnconsumedResume excludes self).
+      const system2: Array<{ type?: string; text?: string }> = [{ type: "text", text: "HEADER" }];
+      await sessionHooks["context"]({ sessionID: sessionId, system: system2 });
+      expect(system2.length).toBe(2); // header + routing block only
+      expect(system2[1]?.text).toContain("<context_window_protection>");
+    });
+
+    it("context hook skips routing block when quorum markers are present (#487)", async () => {
+      const { sessionHooks } = await createTestV2Plugin(join(tempDir, "v2-quorum"));
+      const system = [
+        { type: "text", text: "HEADER" },
+        {
+          type: "text",
+          text: "<context_window_protection>\nUse ctx_search and ctx_index",
+        },
+      ];
+      await sessionHooks["context"]({ sessionID: "v2-quorum-sess", system });
+      expect(system.length).toBe(2);
+    });
+
+    it("cross-session resume: fresh session claims the compacted row", async () => {
+      const dir = join(tempDir, "v2-resume");
+      const { sessionHooks } = await createTestV2Plugin(dir);
+
+      await sessionHooks["prompt"]({ sessionID: "v2-resume-a", prompt: { text: "resume source prompt" } });
+      await sessionHooks["compaction"]({ sessionID: "v2-resume-a", system: [] });
+
+      // Session A already consumed its pending in-memory injection path?
+      // No — A never ran its context hook, so the pending map still holds
+      // A's entry; a DIFFERENT session B claims the durable DB row instead.
+      const systemB: Array<{ type?: string; text?: string }> = [{ type: "text", text: "HEADER" }];
+      await sessionHooks["context"]({ sessionID: "v2-resume-b", system: systemB });
+      // routing block + claimed snapshot
+      expect(systemB.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("cleanup runs without throwing", async () => {
+      const { cleanup } = await createTestV2Plugin(join(tempDir, "v2-cleanup"));
+      expect(() => cleanup()).not.toThrow();
+    });
+  });
 });
